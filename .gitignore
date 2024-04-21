@@ -133,4 +133,8 @@ all.config
 # Kdevelop4
 *.kdev4
 
+# bruh
+out/
+*.zip
+
 !drivers/misc/mediatek/fpsgo_cus/src/*.o
