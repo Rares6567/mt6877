@@ -6,7 +6,7 @@ SECONDS=0 # builtin bash timer
 ZIPNAME="villhaze!kernel-ruby-A13+-$(date '+%Y%m%d-%H%M').zip"
 TC_DIR="$HOME/.cos/xrage"
 AK3_DIR="$HOME/.cos/AnyKernel3"
-DEFCONFIG="fleur_defconfig"
+DEFCONFIG="ruby_defconfig"
 
 export PATH="$TC_DIR/bin:$PATH"
 
@@ -37,7 +37,7 @@ if [ -f "out/arch/arm64/boot/Image.gz" ]; then
 echo -e "\nKernel compiled succesfully! Zipping up...\n"
 if [ -d "$AK3_DIR" ]; then
 cp -r $AK3_DIR AnyKernel3
-elif ! git clone -q https://github.com/in1tialford/AnyKernel3 -b ruby; then
+elif ! git clone https://github.com/fjrXTR/AnyKernel3 -b ruby; then
 echo -e "\nAnyKernel3 repo not found locally and cloning failed! Aborting..."
 exit 1
 fi
@@ -47,7 +47,6 @@ cd AnyKernel3
 git checkout master &> /dev/null
 zip -r9 "../$ZIPNAME" * -x '*.git*' README.md *placeholder
 cd ..
-rm -rf AnyKernel3
 rm -rf out/arch/arm64/boot
 echo -e "\nCompleted in $((SECONDS / 60)) minute(s) and $((SECONDS % 60)) second(s) !"
 echo "Zip: $ZIPNAME"
