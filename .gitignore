@@ -135,6 +135,7 @@ all.config
 
 # bruh
 out/
+AnyKernel*/
 *.zip
 
 !drivers/misc/mediatek/fpsgo_cus/src/*.o
