@@ -59,7 +59,7 @@
 
 int sysctl_panic_on_oom;
 int sysctl_oom_kill_allocating_task;
-int sysctl_oom_dump_tasks = 1;
+int sysctl_oom_dump_tasks;
 
 /*
  * Serializes oom killer invocations (out_of_memory()) from all contexts to
@@ -957,7 +957,7 @@ static void oom_kill_process(struct oom_control *oc, const char *message)
 	struct mem_cgroup *oom_group;
 	unsigned int victim_points = 0;
 	static DEFINE_RATELIMIT_STATE(oom_rs, DEFAULT_RATELIMIT_INTERVAL,
-					      DEFAULT_RATELIMIT_BURST);
+					      1);
 
 	/*
 	 * If the task is already exiting, don't alarm the sysadmin or kill
