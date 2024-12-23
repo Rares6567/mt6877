@@ -37,6 +37,7 @@
 #include "power.h"
 
 #define MTK_SOLUTION 1
+#define DEFAULT_SUSPEND_TIMEOUT_MS 1500
 
 const char * const pm_labels[] = {
 	[PM_SUSPEND_TO_IDLE] = "freeze",
