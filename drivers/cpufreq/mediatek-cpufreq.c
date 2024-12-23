@@ -25,10 +25,22 @@
 #include <linux/slab.h>
 #include <linux/thermal.h>
 
-#define MIN_VOLT_SHIFT		(100000)
-#define MAX_VOLT_SHIFT		(200000)
-#define MAX_VOLT_LIMIT		(1150000)
-#define VOLT_TOL		(10000)
+// Core voltage and frequency definitions
+#define MIN_VOLT_SHIFT           (75000)    // Reduced from 100000 for faster transitions
+#define MAX_VOLT_SHIFT           (150000)   // Reduced from 200000
+#define MAX_VOLT_LIMIT           (1250000)  // Increased from 1150000 for higher OC potential
+#define VOLT_TOL                 (6250)     // Reduced from 10000 for finer control
+#define VOLT_STEP                (12500)    // New: 12.5mV stepping for smoother transitions
+
+// Additional timing controls
+#define VOLTAGE_SETTLE_TIME      (50)       // Microseconds to wait after voltage change
+#define FREQ_SETTLE_TIME         (100)      // Microseconds to wait after frequency change
+#define MAX_VOLT_SCALE_TIME      (1000)     // Maximum time for voltage scaling (microseconds)
+
+// Thermal and power limits
+#define THERMAL_THROTTLE_TEMP    (85000)    // 85°C throttle point
+#define THERMAL_RESET_TEMP       (95000)    // 95°C reset point 
+#define MAX_POWER_LIMIT          (4000)     // Maximum power in mW
 
 /*
  * The struct mtk_cpu_dvfs_info holds necessary information for doing CPU DVFS
@@ -69,135 +81,154 @@ static struct mtk_cpu_dvfs_info *mtk_cpu_dvfs_info_lookup(int cpu)
 }
 
 static int mtk_cpufreq_voltage_tracking(struct mtk_cpu_dvfs_info *info,
-					int new_vproc)
+                                      int new_vproc)
 {
-	struct regulator *proc_reg = info->proc_reg;
-	struct regulator *sram_reg = info->sram_reg;
-	int old_vproc, old_vsram, new_vsram, vsram, vproc, ret;
+    struct regulator *proc_reg = info->proc_reg;
+    struct regulator *sram_reg = info->sram_reg;
+    int old_vproc, old_vsram, new_vsram, vsram, vproc, ret;
+    int steps, i;
+    ktime_t timeout;
+    bool limit_reached = false;
 
-	old_vproc = regulator_get_voltage(proc_reg);
-	if (old_vproc < 0) {
-		pr_err("%s: invalid Vproc value: %d\n", __func__, old_vproc);
-		return old_vproc;
-	}
-	/* Vsram should not exceed the maximum allowed voltage of SoC. */
-	new_vsram = min(new_vproc + MIN_VOLT_SHIFT, MAX_VOLT_LIMIT);
+    old_vproc = regulator_get_voltage(proc_reg);
+    if (old_vproc < 0) {
+        pr_err("%s: invalid Vproc value: %d\n", __func__, old_vproc);
+        return old_vproc;
+    }
 
-	if (old_vproc < new_vproc) {
-		/*
-		 * When scaling up voltages, Vsram and Vproc scale up step
-		 * by step. At each step, set Vsram to (Vproc + 200mV) first,
-		 * then set Vproc to (Vsram - 100mV).
-		 * Keep doing it until Vsram and Vproc hit target voltages.
-		 */
-		do {
-			old_vsram = regulator_get_voltage(sram_reg);
-			if (old_vsram < 0) {
-				pr_err("%s: invalid Vsram value: %d\n",
-				       __func__, old_vsram);
-				return old_vsram;
-			}
-			old_vproc = regulator_get_voltage(proc_reg);
-			if (old_vproc < 0) {
-				pr_err("%s: invalid Vproc value: %d\n",
-				       __func__, old_vproc);
-				return old_vproc;
-			}
+    old_vsram = regulator_get_voltage(sram_reg);
+    if (old_vsram < 0) {
+        pr_err("%s: invalid Vsram value: %d\n", __func__, old_vsram);
+        return old_vsram;
+    }
 
-			vsram = min(new_vsram, old_vproc + MAX_VOLT_SHIFT);
+    /* Calculate new Vsram target with improved constraints */
+    new_vsram = min(new_vproc + MIN_VOLT_SHIFT, MAX_VOLT_LIMIT);
 
-			if (vsram + VOLT_TOL >= MAX_VOLT_LIMIT) {
-				vsram = MAX_VOLT_LIMIT;
+    /* Calculate number of steps for smoother transition */
+    steps = (abs(new_vproc - old_vproc) + VOLT_STEP - 1) / VOLT_STEP;
+    
+    /* Set timeout for voltage scaling */
+    timeout = ktime_add_us(ktime_get(), MAX_VOLT_SCALE_TIME);
 
-				/*
-				 * If the target Vsram hits the maximum voltage,
-				 * try to set the exact voltage value first.
-				 */
-				ret = regulator_set_voltage(sram_reg, vsram,
-							    vsram);
-				if (ret)
-					ret = regulator_set_voltage(sram_reg,
-							vsram - VOLT_TOL,
-							vsram);
+    if (old_vproc < new_vproc) {
+        /* Scaling up voltages */
+        for (i = 1; i <= steps && !ktime_after(ktime_get(), timeout); i++) {
+            /* Calculate intermediate voltages for this step */
+            vproc = min(new_vproc, old_vproc + (i * VOLT_STEP));
+            vsram = min(new_vsram, vproc + MIN_VOLT_SHIFT);
 
-				vproc = new_vproc;
-			} else {
-				ret = regulator_set_voltage(sram_reg, vsram,
-							    vsram + VOLT_TOL);
+            /* Check if we're approaching voltage limits */
+            if (vsram + VOLT_TOL >= MAX_VOLT_LIMIT) {
+                vsram = MAX_VOLT_LIMIT;
+                limit_reached = true;
+            }
 
-				vproc = vsram - MIN_VOLT_SHIFT;
-			}
-			if (ret)
-				return ret;
+            /* Set VSRAM first when scaling up */
+            if (limit_reached) {
+                /* Try exact voltage first, then fallback if needed */
+                ret = regulator_set_voltage(sram_reg, vsram, vsram);
+                if (ret)
+                    ret = regulator_set_voltage(sram_reg, vsram - VOLT_TOL, vsram);
+            } else {
+                ret = regulator_set_voltage(sram_reg, vsram, vsram + VOLT_TOL);
+            }
 
-			ret = regulator_set_voltage(proc_reg, vproc,
-						    vproc + VOLT_TOL);
-			if (ret) {
-				regulator_set_voltage(sram_reg, old_vsram,
-						      old_vsram);
-				return ret;
-			}
-		} while (vproc < new_vproc || vsram < new_vsram);
-	} else if (old_vproc > new_vproc) {
-		/*
-		 * When scaling down voltages, Vsram and Vproc scale down step
-		 * by step. At each step, set Vproc to (Vsram - 200mV) first,
-		 * then set Vproc to (Vproc + 100mV).
-		 * Keep doing it until Vsram and Vproc hit target voltages.
-		 */
-		do {
-			old_vproc = regulator_get_voltage(proc_reg);
-			if (old_vproc < 0) {
-				pr_err("%s: invalid Vproc value: %d\n",
-				       __func__, old_vproc);
-				return old_vproc;
-			}
-			old_vsram = regulator_get_voltage(sram_reg);
-			if (old_vsram < 0) {
-				pr_err("%s: invalid Vsram value: %d\n",
-				       __func__, old_vsram);
-				return old_vsram;
-			}
+            if (ret) {
+                pr_err("%s: Failed to set Vsram to %d uV: %d\n",
+                       __func__, vsram, ret);
+                goto volt_restore;
+            }
 
-			vproc = max(new_vproc, old_vsram - MAX_VOLT_SHIFT);
-			ret = regulator_set_voltage(proc_reg, vproc,
-						    vproc + VOLT_TOL);
-			if (ret)
-				return ret;
+            /* Wait for voltage to settle */
+            udelay(VOLTAGE_SETTLE_TIME);
 
-			if (vproc == new_vproc)
-				vsram = new_vsram;
-			else
-				vsram = max(new_vsram, vproc + MIN_VOLT_SHIFT);
+            /* Now set VPROC */
+            ret = regulator_set_voltage(proc_reg, vproc, vproc + VOLT_TOL);
+            if (ret) {
+                pr_err("%s: Failed to set Vproc to %d uV: %d\n",
+                       __func__, vproc, ret);
+                regulator_set_voltage(sram_reg, old_vsram, old_vsram + VOLT_TOL);
+                goto volt_restore;
+            }
 
-			if (vsram + VOLT_TOL >= MAX_VOLT_LIMIT) {
-				vsram = MAX_VOLT_LIMIT;
+            /* Wait for voltage to settle */
+            udelay(VOLTAGE_SETTLE_TIME);
 
-				/*
-				 * If the target Vsram hits the maximum voltage,
-				 * try to set the exact voltage value first.
-				 */
-				ret = regulator_set_voltage(sram_reg, vsram,
-							    vsram);
-				if (ret)
-					ret = regulator_set_voltage(sram_reg,
-							vsram - VOLT_TOL,
-							vsram);
-			} else {
-				ret = regulator_set_voltage(sram_reg, vsram,
-							    vsram + VOLT_TOL);
-			}
+            /* Verify voltages after setting */
+            int curr_vsram = regulator_get_voltage(sram_reg);
+            int curr_vproc = regulator_get_voltage(proc_reg);
+            
+            if (curr_vsram < vsram || curr_vproc < vproc) {
+                pr_err("%s: Voltage verification failed. Vsram: %d/%d, Vproc: %d/%d\n",
+                       __func__, curr_vsram, vsram, curr_vproc, vproc);
+                ret = -EINVAL;
+                goto volt_restore;
+            }
+        }
+    } else if (old_vproc > new_vproc) {
+        /* Scaling down voltages */
+        for (i = 1; i <= steps && !ktime_after(ktime_get(), timeout); i++) {
+            /* Calculate intermediate voltages for this step */
+            vproc = max(new_vproc, old_vproc - (i * VOLT_STEP));
+            vsram = max(new_vsram, vproc + MIN_VOLT_SHIFT);
 
-			if (ret) {
-				regulator_set_voltage(proc_reg, old_vproc,
-						      old_vproc);
-				return ret;
-			}
-		} while (vproc > new_vproc + VOLT_TOL ||
-			 vsram > new_vsram + VOLT_TOL);
-	}
+            /* Set VPROC first when scaling down */
+            ret = regulator_set_voltage(proc_reg, vproc, vproc + VOLT_TOL);
+            if (ret) {
+                pr_err("%s: Failed to set Vproc to %d uV: %d\n",
+                       __func__, vproc, ret);
+                goto volt_restore;
+            }
 
-	return 0;
+            udelay(VOLTAGE_SETTLE_TIME);
+
+            /* Then set VSRAM */
+            if (vsram + VOLT_TOL >= MAX_VOLT_LIMIT) {
+                vsram = MAX_VOLT_LIMIT;
+                ret = regulator_set_voltage(sram_reg, vsram, vsram);
+                if (ret)
+                    ret = regulator_set_voltage(sram_reg, vsram - VOLT_TOL, vsram);
+            } else {
+                ret = regulator_set_voltage(sram_reg, vsram, vsram + VOLT_TOL);
+            }
+
+            if (ret) {
+                pr_err("%s: Failed to set Vsram to %d uV: %d\n",
+                       __func__, vsram, ret);
+                regulator_set_voltage(proc_reg, old_vproc, old_vproc + VOLT_TOL);
+                goto volt_restore;
+            }
+
+            udelay(VOLTAGE_SETTLE_TIME);
+
+            /* Verify voltages */
+            int curr_vsram = regulator_get_voltage(sram_reg);
+            int curr_vproc = regulator_get_voltage(proc_reg);
+            
+            if (curr_vsram > old_vsram || curr_vproc > old_vproc) {
+                pr_err("%s: Voltage verification failed during scaling down\n",
+                       __func__);
+                ret = -EINVAL;
+                goto volt_restore;
+            }
+        }
+    }
+
+    /* Check if we hit the timeout */
+    if (ktime_after(ktime_get(), timeout)) {
+        pr_warn("%s: Voltage scaling timeout reached\n", __func__);
+        ret = -ETIMEDOUT;
+        goto volt_restore;
+    }
+
+    return 0;
+
+volt_restore:
+    /* Restore original voltages on failure */
+    regulator_set_voltage(proc_reg, old_vproc, old_vproc + VOLT_TOL);
+    regulator_set_voltage(sram_reg, old_vsram, old_vsram + VOLT_TOL);
+    return ret;
 }
 
 static int mtk_cpufreq_set_voltage(struct mtk_cpu_dvfs_info *info, int vproc)
@@ -209,100 +240,152 @@ static int mtk_cpufreq_set_voltage(struct mtk_cpu_dvfs_info *info, int vproc)
 					     vproc + VOLT_TOL);
 }
 
+// Enhanced frequency transition function
 static int mtk_cpufreq_set_target(struct cpufreq_policy *policy,
-				  unsigned int index)
+                                 unsigned int index)
 {
-	struct cpufreq_frequency_table *freq_table = policy->freq_table;
-	struct clk *cpu_clk = policy->clk;
-	struct clk *armpll = clk_get_parent(cpu_clk);
-	struct mtk_cpu_dvfs_info *info = policy->driver_data;
-	struct device *cpu_dev = info->cpu_dev;
-	struct dev_pm_opp *opp;
-	long freq_hz, old_freq_hz;
-	int vproc, old_vproc, inter_vproc, target_vproc, ret;
+    struct cpufreq_frequency_table *freq_table = policy->freq_table;
+    struct clk *cpu_clk = policy->clk;
+    struct clk *armpll = clk_get_parent(cpu_clk);
+    struct mtk_cpu_dvfs_info *info = policy->driver_data;
+    struct thermal_zone_device *tz;
+    int temp, vproc, old_vproc, inter_vproc, target_vproc, ret;
+    unsigned long freq_hz, old_freq_hz;
+    ktime_t timeout;
 
-	inter_vproc = info->intermediate_voltage;
+    // Get current temperature
+    tz = thermal_zone_get_zone_by_name("cpu-thermal");
+    if (!IS_ERR(tz)) {
+        ret = thermal_zone_get_temp(tz, &temp);
+        if (!ret && temp >= THERMAL_THROTTLE_TEMP) {
+            if (temp >= THERMAL_RESET_TEMP)
+                return -EINVAL;
+            // Adjust index for thermal throttling
+            index = cpufreq_cooling_get_level(policy->cpu, temp);
+        }
+    }
 
-	old_freq_hz = clk_get_rate(cpu_clk);
-	old_vproc = regulator_get_voltage(info->proc_reg);
-	if (old_vproc < 0) {
-		pr_err("%s: invalid Vproc value: %d\n", __func__, old_vproc);
-		return old_vproc;
-	}
+    inter_vproc = info->intermediate_voltage;
+    old_freq_hz = clk_get_rate(cpu_clk);
+    freq_hz = freq_table[index].frequency * 1000;
 
-	freq_hz = freq_table[index].frequency * 1000;
+    // Set timeout for frequency transition
+    timeout = ktime_add_us(ktime_get(), FREQ_SETTLE_TIME);
 
-	opp = dev_pm_opp_find_freq_ceil(cpu_dev, &freq_hz);
-	if (IS_ERR(opp)) {
-		pr_err("cpu%d: failed to find OPP for %ld\n",
-		       policy->cpu, freq_hz);
-		return PTR_ERR(opp);
-	}
-	vproc = dev_pm_opp_get_voltage(opp);
-	dev_pm_opp_put(opp);
+    // Voltage preparation phase
+    if (freq_hz > old_freq_hz) {
+        // Need higher voltage for higher frequency
+        target_vproc = inter_vproc > vproc ? inter_vproc : vproc;
+        ret = mtk_cpufreq_set_voltage(info, target_vproc);
+        if (ret) {
+            pr_err("CPU voltage scale up failed: %d\n", ret);
+            return ret;
+        }
+        udelay(VOLTAGE_SETTLE_TIME);
+    }
 
-	/*
-	 * If the new voltage or the intermediate voltage is higher than the
-	 * current voltage, scale up voltage first.
-	 */
-	target_vproc = (inter_vproc > vproc) ? inter_vproc : vproc;
-	if (old_vproc < target_vproc) {
-		ret = mtk_cpufreq_set_voltage(info, target_vproc);
-		if (ret) {
-			pr_err("cpu%d: failed to scale up voltage!\n",
-			       policy->cpu);
-			mtk_cpufreq_set_voltage(info, old_vproc);
-			return ret;
-		}
-	}
+    // Frequency transition phase
+    ret = clk_set_parent(cpu_clk, info->inter_clk);
+    if (ret)
+        goto freq_fail;
 
-	/* Reparent the CPU clock to intermediate clock. */
-	ret = clk_set_parent(cpu_clk, info->inter_clk);
-	if (ret) {
-		pr_err("cpu%d: failed to re-parent cpu clock!\n",
-		       policy->cpu);
-		mtk_cpufreq_set_voltage(info, old_vproc);
-		WARN_ON(1);
-		return ret;
-	}
+    ret = clk_set_rate_timeout(armpll, freq_hz, timeout);
+    if (ret)
+        goto freq_fail;
 
-	/* Set the original PLL to target rate. */
-	ret = clk_set_rate(armpll, freq_hz);
-	if (ret) {
-		pr_err("cpu%d: failed to scale cpu clock rate!\n",
-		       policy->cpu);
-		clk_set_parent(cpu_clk, armpll);
-		mtk_cpufreq_set_voltage(info, old_vproc);
-		return ret;
-	}
+    ret = clk_set_parent(cpu_clk, armpll);
+    if (ret)
+        goto freq_fail;
 
-	/* Set parent of CPU clock back to the original PLL. */
-	ret = clk_set_parent(cpu_clk, armpll);
-	if (ret) {
-		pr_err("cpu%d: failed to re-parent cpu clock!\n",
-		       policy->cpu);
-		mtk_cpufreq_set_voltage(info, inter_vproc);
-		WARN_ON(1);
-		return ret;
-	}
+    // Post frequency adjustment voltage phase
+    if (freq_hz < old_freq_hz) {
+        // Can reduce voltage after lowering frequency
+        ret = mtk_cpufreq_set_voltage(info, vproc);
+        if (ret) {
+            pr_err("CPU voltage scale down failed: %d\n", ret);
+            goto freq_fail;
+        }
+    }
 
-	/*
-	 * If the new voltage is lower than the intermediate voltage or the
-	 * original voltage, scale down to the new voltage.
-	 */
-	if (vproc < inter_vproc || vproc < old_vproc) {
-		ret = mtk_cpufreq_set_voltage(info, vproc);
-		if (ret) {
-			pr_err("cpu%d: failed to scale down voltage!\n",
-			       policy->cpu);
-			clk_set_parent(cpu_clk, info->inter_clk);
-			clk_set_rate(armpll, old_freq_hz);
-			clk_set_parent(cpu_clk, armpll);
-			return ret;
-		}
-	}
+    return 0;
 
-	return 0;
+freq_fail:
+    pr_err("CPU frequency transition failed: %d\n", ret);
+    // Attempt recovery
+    clk_set_parent(cpu_clk, info->inter_clk);
+    clk_set_rate(armpll, old_freq_hz);
+    clk_set_parent(cpu_clk, armpll);
+    return ret;
+}
+
+// Enhanced CPU cooling implementation
+static struct thermal_cooling_device_ops mtk_cpu_cooling_ops = {
+    .get_max_state = cpu_cooling_get_max_state,
+    .get_cur_state = cpu_cooling_get_cur_state,
+    .set_cur_state = cpu_cooling_set_cur_state,
+    .get_requested_power = cpu_cooling_get_requested_power,
+    .state2power = cpu_cooling_state2power,
+    .power2state = cpu_cooling_power2state,
+};
+
+// Enhanced CPU initialization
+static int mtk_cpufreq_init(struct cpufreq_policy *policy)
+{
+    struct mtk_cpu_dvfs_info *info;
+    struct cpufreq_frequency_table *freq_table;
+    struct dev_pm_opp *opp;
+    unsigned long rate;
+    int ret;
+
+    info = mtk_cpu_dvfs_info_lookup(policy->cpu);
+    if (!info)
+        return -EINVAL;
+
+    ret = dev_pm_opp_init_cpufreq_table(info->cpu_dev, &freq_table);
+    if (ret)
+        return ret;
+
+    // Optimize OPP table
+    for (rate = 0; ; rate++) {
+        opp = dev_pm_opp_find_freq_ceil(info->cpu_dev, &rate);
+        if (IS_ERR(opp)) {
+            if (PTR_ERR(opp) == -ERANGE)
+                break;
+            ret = PTR_ERR(opp);
+            goto free_table;
+        }
+
+        // Apply custom voltage optimization
+        unsigned long voltage = dev_pm_opp_get_voltage(opp);
+        // Optimize voltage based on frequency
+        if (rate <= 1000000000)  // Below 1GHz
+            voltage = voltage - (voltage * 5 / 100);  // Reduce by 5%
+        else if (rate <= 2000000000)  // 1-2GHz
+            voltage = voltage - (voltage * 3 / 100);  // Reduce by 3%
+        // Above 2GHz keeps original voltage for stability
+
+        dev_pm_opp_put(opp);
+
+        ret = dev_pm_opp_adjust_voltage(info->cpu_dev, rate, voltage);
+        if (ret)
+            goto free_table;
+    }
+
+    policy->freq_table = freq_table;
+    policy->driver_data = info;
+    policy->clk = info->cpu_clk;
+    
+    // Set conservative default governor
+    policy->governor = cpufreq_default_governor();
+    
+    // Enable fast frequency switching if supported
+    policy->fast_switch_possible = true;
+
+    return 0;
+
+free_table:
+    dev_pm_opp_free_cpufreq_table(info->cpu_dev, &freq_table);
+    return ret;
 }
 
 #define DYNAMIC_POWER "dynamic-power-coefficient"
