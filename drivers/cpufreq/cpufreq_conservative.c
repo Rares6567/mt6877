@@ -31,10 +31,10 @@ struct cs_dbs_tuners {
 };
 
 /* Conservative governor macros */
-#define DEF_FREQUENCY_UP_THRESHOLD		(80)
-#define DEF_FREQUENCY_DOWN_THRESHOLD		(20)
-#define DEF_FREQUENCY_STEP			(5)
-#define DEF_SAMPLING_DOWN_FACTOR		(1)
+#define DEF_FREQUENCY_UP_THRESHOLD		(75)
+#define DEF_FREQUENCY_DOWN_THRESHOLD		(30)
+#define DEF_FREQUENCY_STEP			(10)
+#define DEF_SAMPLING_DOWN_FACTOR		(2)
 #define MAX_SAMPLING_DOWN_FACTOR		(10)
 
 static inline unsigned int get_freq_step(struct cs_dbs_tuners *cs_tuners,
@@ -42,9 +42,9 @@ static inline unsigned int get_freq_step(struct cs_dbs_tuners *cs_tuners,
 {
 	unsigned int freq_step = (cs_tuners->freq_step * policy->max) / 100;
 
-	/* max freq cannot be less than 100. But who knows... */
-	if (unlikely(freq_step == 0))
-		freq_step = DEF_FREQUENCY_STEP;
+	/* Modified minimum step size for better efficiency */
+	if (unlikely(freq_step < (policy->max / 20)))
+		freq_step = policy->max / 20;  /* 5% minimum step */
 
 	return freq_step;
 }
@@ -92,7 +92,7 @@ static unsigned int cs_dbs_update(struct cpufreq_policy *policy)
 	 * we didn't update the frequency.
 	 */
 	if (policy_dbs->idle_periods < UINT_MAX) {
-		unsigned int freq_steps = policy_dbs->idle_periods * freq_step;
+		unsigned int freq_steps = (policy_dbs->idle_periods * freq_step) / 2;
 
 		if (requested_freq > policy->min + freq_steps)
 			requested_freq -= freq_steps;
@@ -106,9 +106,12 @@ static unsigned int cs_dbs_update(struct cpufreq_policy *policy)
 	if (load > dbs_data->up_threshold) {
 		dbs_info->down_skip = 0;
 
-		/* if we are already at full speed then break out early */
 		if (requested_freq == policy->max)
 			goto out;
+
+		/* More aggressive ramping when load is very high */
+		if (load > 90)
+            freq_step = freq_step * 3 / 2;  /* 50% larger steps for high load */
 
 		requested_freq += freq_step;
 		if (requested_freq > policy->max)
@@ -126,12 +129,12 @@ static unsigned int cs_dbs_update(struct cpufreq_policy *policy)
 
 	/* Check for frequency decrease */
 	if (load < cs_tuners->down_threshold) {
-		/*
-		 * if we cannot reduce the frequency anymore, break out early
-		 */
 		if (requested_freq == policy->min)
 			goto out;
 
+		/* More gradual frequency decrease */
+		freq_step = freq_step * 2 / 3;  /* Smaller steps for decreasing */
+		
 		if (requested_freq > freq_step)
 			requested_freq -= freq_step;
 		else
